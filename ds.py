@@ -9,7 +9,7 @@ from datetime import datetime, UTC
 # ---------------------- ЗАГРУЗКА НАСТРОЕК ----------------------
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.environ.get("DISCORD_TOKEN")
 ARTICLE_CHANNEL_ID = int(os.getenv("ARTICLE_CHANNEL_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
@@ -306,7 +306,9 @@ async def referral(interaction: discord.Interaction):
     )
 
 # ---------------------- ЗАПУСК ----------------------
+print("TOKEN:", TOKEN)
+
 if not TOKEN:
-    raise ValueError("Нет токена в .env")
+    raise ValueError("Нет токена в ENV")
 
 bot.run(TOKEN)
