@@ -1,0 +1,5 @@
+cache/
+Projects/cache/
+*.db
+.env
+__pycache__/
