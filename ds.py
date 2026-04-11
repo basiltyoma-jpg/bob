@@ -7,12 +7,12 @@ from dotenv import load_dotenv
 from datetime import datetime, UTC
 
 # ---------------------- ЗАГРУЗКА НАСТРОЕК ----------------------
-load_dotenv()
-
 TOKEN = os.environ.get("DISCORD_TOKEN")
+print("ENV KEYS:", list(os.environ.keys()))
+print("TOKEN:", TOKEN)
+print(os.environ)
 ARTICLE_CHANNEL_ID = int(os.getenv("ARTICLE_CHANNEL_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
-
 DATABASE = "classic_coins.db"
 
 COINS_PER_HOUR_VOICE = 10
