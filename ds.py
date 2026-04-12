@@ -114,21 +114,6 @@ async def on_member_join(member):
 
         await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
 
-# ---------------------- КОМАНДА РЕФЕРАЛКИ ----------------------
-@tree.command(name="referral", description="Получить свою реферальную ссылку")
-async def referral(interaction: discord.Interaction):
-    invite = await interaction.channel.create_invite(
-        max_age=0,
-        max_uses=0,
-        unique=True
-    )
-
-    await interaction.response.send_message(
-        f"🔗 Твоя ссылка: {invite.url}\n"
-        f"💰 За каждого — {COINS_PER_REFERRAL} коинов",
-        ephemeral=True
-    )
-
 # ---------------------- ФОРУМ ----------------------
 @bot.event
 async def on_thread_create(thread):
