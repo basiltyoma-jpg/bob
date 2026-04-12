@@ -78,14 +78,18 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     guild = member.guild
-    invites = await guild.invites()
+
+    try:
+        invites = await guild.invites()
+    except:
+        return
 
     old = invite_cache.get(guild.id, {})
     inviter = None
 
-    for i in invites:
-        if i.uses > old.get(i.code, 0):
-            inviter = i.inviter
+    for invite in invites:
+        if invite.uses > old.get(invite.code, 0):
+            inviter = invite.inviter
             break
 
     invite_cache[guild.id] = {i.code: i.uses for i in invites}
@@ -95,14 +99,35 @@ async def on_member_join(member):
         await ensure_user(inviter.id)
 
         async with aiosqlite.connect(DATABASE) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO referrals (invited_id, inviter_id) VALUES (?, ?)",
-                (member.id, inviter.id)
-            )
+            await db.execute("""
+            INSERT OR IGNORE INTO referrals (invited_id, inviter_id)
+            VALUES (?, ?)
+            """, (member.id, inviter.id))
             await db.commit()
 
         await add_coins(inviter.id, COINS_PER_REFERRAL)
+
+        try:
+            await inviter.send(f"🎉 Ты пригласил {member}! +{COINS_PER_REFERRAL} коинов")
+        except:
+            pass
+
         await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
+
+# ---------------------- КОМАНДА РЕФЕРАЛКИ ----------------------
+@tree.command(name="referral", description="Получить свою реферальную ссылку")
+async def referral(interaction: discord.Interaction):
+    invite = await interaction.channel.create_invite(
+        max_age=0,
+        max_uses=0,
+        unique=True
+    )
+
+    await interaction.response.send_message(
+        f"🔗 Твоя ссылка: {invite.url}\n"
+        f"💰 За каждого — {COINS_PER_REFERRAL} коинов",
+        ephemeral=True
+    )
 
 # ---------------------- ФОРУМ ----------------------
 @bot.event
@@ -136,7 +161,7 @@ async def on_thread_create(thread):
     await add_coins(user_id, COINS_PER_ARTICLE)
     await log(f"📝 <@{user_id}> создал тему (+{COINS_PER_ARTICLE})")
 
-# ---------------------- ВОЙС ТРЕК ----------------------
+# ---------------------- ВОЙС ----------------------
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
@@ -148,7 +173,7 @@ async def on_voice_state_update(member, before, after):
     elif before.channel and after.channel is None:
         voice_sessions.pop(member.id, None)
 
-# ---------------------- АВТО ВОЙС НАГРАДА ----------------------
+# ---------------------- АВТО ВОЙС ----------------------
 @tasks.loop(minutes=1)
 async def voice_reward_loop():
     for guild in bot.guilds:
@@ -199,7 +224,6 @@ async def balance(interaction: discord.Interaction):
     coins = row[0]
     seconds = row[1]
 
-    # 🔥 ДОБАВЛЯЕМ ЖИВОЕ ВРЕМЯ
     if user_id in voice_sessions:
         now = datetime.now(UTC)
         start = voice_sessions[user_id]
