@@ -65,22 +65,19 @@ async def log(text):
 async def on_ready():
     await init_db()
 
-    try:
-        synced = await tree.sync()
-        print(f"✅ Slash-команд: {len(synced)}")
-    except Exception as e:
-        print("Ошибка sync:", e)
+    synced = await tree.sync()
+    print(f"✅ Slash-команд: {len(synced)}")
 
     for guild in bot.guilds:
         try:
             invites = await guild.invites()
             invite_cache[guild.id] = {i.code: i.uses for i in invites}
-        except discord.Forbidden:
-            print(f"❌ Нет прав на invites в {guild.name}")
+            print(f"✅ Инвайты загружены: {guild.name}")
+        except Exception as e:
+            print(f"❌ Ошибка инвайтов {guild.name}: {e}")
             invite_cache[guild.id] = {}
 
     voice_reward_loop.start()
-
     print("✅ Бот запущен")
 
 # ---------------------- РЕФЕРАЛ ----------------------
@@ -90,53 +87,42 @@ async def on_member_join(member):
 
     try:
         invites = await guild.invites()
-    except discord.Forbidden:
+    except Exception as e:
+        print("❌ Ошибка получения инвайтов:", e)
         return
 
     old = invite_cache.get(guild.id, {})
     inviter = None
 
     for invite in invites:
-        if invite.uses > old.get(invite.code, 0):
+        if invite.code in old and invite.uses > old[invite.code]:
             inviter = invite.inviter
             break
 
     invite_cache[guild.id] = {i.code: i.uses for i in invites}
 
-    if inviter and inviter.id != member.id:
-        await ensure_user(member.id)
-        await ensure_user(inviter.id)
+    if not inviter:
+        print("⚠️ Не удалось определить кто пригласил")
+        return
 
-        async with aiosqlite.connect(DATABASE) as db:
-            await db.execute("""
-            INSERT OR IGNORE INTO referrals (invited_id, inviter_id)
-            VALUES (?, ?)
-            """, (member.id, inviter.id))
-            await db.commit()
+    if inviter.id == member.id:
+        return
 
-        await add_coins(inviter.id, COINS_PER_REFERRAL)
+    await ensure_user(member.id)
+    await ensure_user(inviter.id)
 
-        try:
-            await inviter.send(f"🎉 Ты пригласил {member}! +{COINS_PER_REFERRAL} коинов")
-        except:
-            pass
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("""
+        INSERT OR IGNORE INTO referrals (invited_id, inviter_id)
+        VALUES (?, ?)
+        """, (member.id, inviter.id))
+        await db.commit()
 
-        await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
+    await add_coins(inviter.id, COINS_PER_REFERRAL)
 
-# ---------------------- КОМАНДА РЕФЕРАЛ ----------------------
-@tree.command(name="referral", description="Получить свою реферальную ссылку")
-async def referral(interaction: discord.Interaction):
-    invite = await interaction.channel.create_invite(
-        max_age=0,
-        max_uses=0,
-        unique=True
-    )
+    print(f"🎉 {inviter} пригласил {member}")
 
-    await interaction.response.send_message(
-        f"🔗 Твоя ссылка:\n{invite.url}\n"
-        f"💰 За каждого: {COINS_PER_REFERRAL} коинов",
-        ephemeral=True
-    )
+    await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
 
 # ---------------------- ФОРУМ ----------------------
 @bot.event
