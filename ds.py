@@ -236,6 +236,20 @@ async def balance(interaction: discord.Interaction):
         ephemeral=True
     )
 
+@tree.command(name="referral", description="Получить реферальную ссылку")
+async def referral(interaction: discord.Interaction):
+    invite = await interaction.channel.create_invite(
+        max_age=0,   # бесконечная
+        max_uses=0,  # без лимита
+        unique=True
+    )
+
+    await interaction.response.send_message(
+        f"🔗 Твоя реферальная ссылка:\n{invite.url}\n\n"
+        f"💰 За каждого приглашённого: {COINS_PER_REFERRAL} коинов",
+        ephemeral=True
+    )
+
 @tree.command(name="top")
 async def top(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
