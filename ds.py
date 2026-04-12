@@ -199,6 +199,12 @@ async def balance(interaction: discord.Interaction):
     coins = row[0]
     seconds = row[1]
 
+    # 🔥 ДОБАВЛЯЕМ ЖИВОЕ ВРЕМЯ
+    if user_id in voice_sessions:
+        now = datetime.now(UTC)
+        start = voice_sessions[user_id]
+        seconds += int((now - start).total_seconds())
+
     mins = max(1, (3600 - seconds) // 60)
 
     await interaction.response.send_message(
