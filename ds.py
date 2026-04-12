@@ -64,11 +64,20 @@ async def log(text):
 @bot.event
 async def on_ready():
     await init_db()
-    await tree.sync()
+
+    try:
+        synced = await tree.sync()
+        print(f"✅ Slash-команд: {len(synced)}")
+    except Exception as e:
+        print("Ошибка sync:", e)
 
     for guild in bot.guilds:
-        invites = await guild.invites()
-        invite_cache[guild.id] = {i.code: i.uses for i in invites}
+        try:
+            invites = await guild.invites()
+            invite_cache[guild.id] = {i.code: i.uses for i in invites}
+        except discord.Forbidden:
+            print(f"❌ Нет прав на invites в {guild.name}")
+            invite_cache[guild.id] = {}
 
     voice_reward_loop.start()
 
@@ -81,7 +90,7 @@ async def on_member_join(member):
 
     try:
         invites = await guild.invites()
-    except:
+    except discord.Forbidden:
         return
 
     old = invite_cache.get(guild.id, {})
@@ -113,6 +122,21 @@ async def on_member_join(member):
             pass
 
         await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
+
+# ---------------------- КОМАНДА РЕФЕРАЛ ----------------------
+@tree.command(name="referral", description="Получить свою реферальную ссылку")
+async def referral(interaction: discord.Interaction):
+    invite = await interaction.channel.create_invite(
+        max_age=0,
+        max_uses=0,
+        unique=True
+    )
+
+    await interaction.response.send_message(
+        f"🔗 Твоя ссылка:\n{invite.url}\n"
+        f"💰 За каждого: {COINS_PER_REFERRAL} коинов",
+        ephemeral=True
+    )
 
 # ---------------------- ФОРУМ ----------------------
 @bot.event
@@ -158,7 +182,7 @@ async def on_voice_state_update(member, before, after):
     elif before.channel and after.channel is None:
         voice_sessions.pop(member.id, None)
 
-# ---------------------- АВТО ВОЙС ----------------------
+# ---------------------- АВТО НАГРАДА ВОЙС ----------------------
 @tasks.loop(minutes=1)
 async def voice_reward_loop():
     for guild in bot.guilds:
@@ -218,20 +242,6 @@ async def balance(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"💰 {coins} коинов\n⏳ До награды: {mins} мин",
-        ephemeral=True
-    )
-
-@tree.command(name="referral", description="Получить реферальную ссылку")
-async def referral(interaction: discord.Interaction):
-    invite = await interaction.channel.create_invite(
-        max_age=0,   # бесконечная
-        max_uses=0,  # без лимита
-        unique=True
-    )
-
-    await interaction.response.send_message(
-        f"🔗 Твоя реферальная ссылка:\n{invite.url}\n\n"
-        f"💰 За каждого приглашённого: {COINS_PER_REFERRAL} коинов",
         ephemeral=True
     )
 
