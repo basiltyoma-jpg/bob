@@ -1,253 +1,292 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 import os
+from dotenv import load_dotenv
 from datetime import datetime, UTC
 
-TOKEN = os.environ.get("DISCORD_TOKEN")
-ARTICLE_CHANNEL_ID = int(os.environ.get("ARTICLE_CHANNEL_ID", 0))
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
+# ---------------------- НАСТРОЙКИ ----------------------
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Укажите ID вашего сервера и канала со статьями
+GUILD_ID = 1492164546926739577  # Замените на ID вашего сервера
+ARTICLE_CHANNEL_ID = int(os.getenv("ARTICLE_CHANNEL_ID", "0"))
 
 DATABASE = "classic_coins.db"
 
 COINS_PER_HOUR_VOICE = 10
 COINS_PER_ARTICLE = 30
 COINS_PER_REFERRAL = 50
-ARTICLE_COOLDOWN = 3600
+COINS_FOR_MEETING = 300
+MIN_ARTICLE_LENGTH = 200
 
-intents = discord.Intents.all()
+# ---------------------- INTENTS ----------------------
+intents = discord.Intents.default()
+intents.members = True
+intents.voice_states = True
+intents.message_content = True
+intents.guilds = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+guild = discord.Object(id=GUILD_ID)
 
 voice_sessions = {}
 invite_cache = {}
 
-# ---------------------- БД ----------------------
+# ---------------------- БАЗА ДАННЫХ ----------------------
 async def init_db():
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            coins INTEGER DEFAULT 0,
-            voice_seconds INTEGER DEFAULT 0,
-            last_article INTEGER DEFAULT 0
-        )
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                coins INTEGER DEFAULT 0
+            )
         """)
+
+        # Добавление столбца voice_seconds, если его нет
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            columns = [row[1] async for row in cursor]
+        if "voice_seconds" not in columns:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN voice_seconds INTEGER DEFAULT 0"
+            )
+
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            invited_id INTEGER PRIMARY KEY,
-            inviter_id INTEGER
-        )
+            CREATE TABLE IF NOT EXISTS referrals (
+                invited_id INTEGER PRIMARY KEY,
+                inviter_id INTEGER,
+                joined_at TEXT
+            )
         """)
         await db.commit()
 
-async def ensure_user(user_id):
+# ---------------------- РАБОТА С КОИНАМИ ----------------------
+async def ensure_user(user_id: int):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, coins, voice_seconds) VALUES (?, 0, 0)",
+            (user_id,)
+        )
         await db.commit()
 
-async def add_coins(user_id, amount):
+async def add_coins(user_id: int, amount: int):
     await ensure_user(user_id)
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amount, user_id))
+        await db.execute(
+            "UPDATE users SET coins = coins + ? WHERE user_id = ?",
+            (amount, user_id)
+        )
         await db.commit()
 
-# ---------------------- ЛОГ ----------------------
-async def log(text):
-    if LOG_CHANNEL_ID:
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if channel:
-            await channel.send(text)
+async def remove_coins(user_id: int, amount: int) -> bool:
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT coins FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            coins = (await cursor.fetchone())[0]
 
-# ---------------------- READY ----------------------
+        if coins < amount:
+            return False
+
+        await db.execute(
+            "UPDATE users SET coins = coins - ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        await db.commit()
+        return True
+
+async def get_user_data(user_id: int):
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT coins, voice_seconds FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchone()
+
+async def add_voice_time(user_id: int, seconds: int):
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT voice_seconds FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            current_seconds = (await cursor.fetchone())[0]
+
+        total_seconds = current_seconds + seconds
+        hours = total_seconds // 3600
+        remaining_seconds = total_seconds % 3600
+        coins_to_add = hours * COINS_PER_HOUR_VOICE
+
+        await db.execute(
+            "UPDATE users SET coins = coins + ?, voice_seconds = ? WHERE user_id = ?",
+            (coins_to_add, remaining_seconds, user_id)
+        )
+        await db.commit()
+
+# ---------------------- СОБЫТИЯ ----------------------
 @bot.event
 async def on_ready():
     await init_db()
+    print(f"✅ Бот {bot.user} запущен!")
 
-    synced = await tree.sync()
-    print(f"✅ Slash-команд: {len(synced)}")
+    # Мгновенная синхронизация команд для сервера
+    await tree.sync(guild=guild)
+    print("✅ Slash-команды синхронизированы для сервера.")
 
-    for guild in bot.guilds:
+    # Кэш приглашений
+    for g in bot.guilds:
         try:
-            invites = await guild.invites()
-            invite_cache[guild.id] = {i.code: i.uses for i in invites}
-            print(f"✅ Инвайты загружены: {guild.name}")
-        except Exception as e:
-            print(f"❌ Ошибка инвайтов {guild.name}: {e}")
-            invite_cache[guild.id] = {}
+            invites = await g.invites()
+            invite_cache[g.id] = {invite.code: invite.uses for invite in invites}
+        except discord.Forbidden:
+            invite_cache[g.id] = {}
 
-    voice_reward_loop.start()
-    print("✅ Бот запущен")
+# ---------------------- РЕФЕРАЛЬНАЯ СИСТЕМА ----------------------
+@tree.command(name="referral", description="Получить реферальную ссылку", guild=guild)
+async def referral(interaction: discord.Interaction):
+    invite = await interaction.channel.create_invite(
+        max_age=0,
+        max_uses=0,
+        unique=True,
+        reason=f"Referral for {interaction.user}"
+    )
 
-# ---------------------- РЕФЕРАЛ ----------------------
+    await interaction.response.send_message(
+        f"🔗 Ваша реферальная ссылка: {invite.url}\n"
+        f"Вы получите {COINS_PER_REFERRAL} коинов за каждого приглашённого!",
+        ephemeral=True
+    )
+
 @bot.event
 async def on_member_join(member):
-    guild = member.guild
-
+    guild_obj = member.guild
     try:
-        invites = await guild.invites()
-    except Exception as e:
-        print("❌ Ошибка получения инвайтов:", e)
+        new_invites = await guild_obj.invites()
+    except discord.Forbidden:
         return
 
-    old = invite_cache.get(guild.id, {})
+    old_invites = invite_cache.get(guild_obj.id, {})
     inviter = None
 
-    for invite in invites:
-        if invite.code in old and invite.uses > old[invite.code]:
+    for invite in new_invites:
+        if invite.uses > old_invites.get(invite.code, 0):
             inviter = invite.inviter
             break
 
-    invite_cache[guild.id] = {i.code: i.uses for i in invites}
+    invite_cache[guild_obj.id] = {
+        invite.code: invite.uses for invite in new_invites
+    }
 
-    if not inviter:
-        print("⚠️ Не удалось определить кто пригласил")
-        return
+    if inviter and inviter.id != member.id:
+        await add_coins(inviter.id, COINS_PER_REFERRAL)
+        try:
+            await inviter.send(
+                f"🎉 Вы пригласили {member.mention} и получили {COINS_PER_REFERRAL} коинов!"
+            )
+        except discord.Forbidden:
+            pass
 
-    if inviter.id == member.id:
-        return
-
-    await ensure_user(member.id)
-    await ensure_user(inviter.id)
-
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""
-        INSERT OR IGNORE INTO referrals (invited_id, inviter_id)
-        VALUES (?, ?)
-        """, (member.id, inviter.id))
-        await db.commit()
-
-    await add_coins(inviter.id, COINS_PER_REFERRAL)
-
-    print(f"🎉 {inviter} пригласил {member}")
-
-    await log(f"🎉 {inviter} пригласил {member} (+{COINS_PER_REFERRAL})")
-
-# ---------------------- ФОРУМ ----------------------
+# ---------------------- НАГРАДА ЗА СТАТЬИ ----------------------
 @bot.event
-async def on_thread_create(thread):
-    if thread.parent_id != ARTICLE_CHANNEL_ID:
+async def on_message(message):
+    if message.author.bot or not message.guild:
         return
 
-    user_id = thread.owner_id
-    await ensure_user(user_id)
+    if message.channel.id == ARTICLE_CHANNEL_ID:
+        if len(message.content) >= MIN_ARTICLE_LENGTH:
+            await add_coins(message.author.id, COINS_PER_ARTICLE)
+            await message.add_reaction("🪙")
+        else:
+            await message.reply(
+                f"Статья должна содержать не менее {MIN_ARTICLE_LENGTH} символов."
+            )
 
-    now = int(datetime.now(UTC).timestamp())
+    await bot.process_commands(message)
 
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT last_article FROM users WHERE user_id = ?",
-            (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        last = row[0] if row else 0
-
-        if now - last < ARTICLE_COOLDOWN:
-            return
-
-        await db.execute(
-            "UPDATE users SET last_article = ? WHERE user_id = ?",
-            (now, user_id)
-        )
-        await db.commit()
-
-    await add_coins(user_id, COINS_PER_ARTICLE)
-    await log(f"📝 <@{user_id}> создал тему (+{COINS_PER_ARTICLE})")
-
-# ---------------------- ВОЙС ----------------------
+# ---------------------- ГОЛОСОВАЯ АКТИВНОСТЬ ----------------------
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
+    now = datetime.now(UTC)
+
     if before.channel is None and after.channel is not None:
-        voice_sessions[member.id] = datetime.now(UTC)
-
-    elif before.channel and after.channel is None:
-        voice_sessions.pop(member.id, None)
-
-# ---------------------- АВТО НАГРАДА ВОЙС ----------------------
-@tasks.loop(minutes=1)
-async def voice_reward_loop():
-    for guild in bot.guilds:
-        for vc in guild.voice_channels:
-            members = [m for m in vc.members if not m.bot]
-
-            if len(members) < 2:
-                continue
-
-            for member in members:
-                user_id = member.id
-                await ensure_user(user_id)
-
-                async with aiosqlite.connect(DATABASE) as db:
-                    async with db.execute(
-                        "SELECT voice_seconds FROM users WHERE user_id = ?",
-                        (user_id,)
-                    ) as cur:
-                        row = await cur.fetchone()
-
-                    seconds = row[0] if row else 0
-                    seconds += 60
-
-                    if seconds >= 3600:
-                        seconds -= 3600
-                        await add_coins(user_id, COINS_PER_HOUR_VOICE)
-                        await log(f"🎙 {member} получил {COINS_PER_HOUR_VOICE} коинов")
-
-                    await db.execute(
-                        "UPDATE users SET voice_seconds = ? WHERE user_id = ?",
-                        (seconds, user_id)
-                    )
-                    await db.commit()
+        voice_sessions[member.id] = now
+    elif before.channel is not None and after.channel is None:
+        start = voice_sessions.pop(member.id, None)
+        if start:
+            seconds = int((now - start).total_seconds())
+            await add_voice_time(member.id, seconds)
 
 # ---------------------- КОМАНДЫ ----------------------
-@tree.command(name="balance")
+@tree.command(name="balance", description="Показать баланс", guild=guild)
 async def balance(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    await ensure_user(user_id)
-
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT coins, voice_seconds FROM users WHERE user_id = ?",
-            (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-
-    coins = row[0]
-    seconds = row[1]
-
-    if user_id in voice_sessions:
-        now = datetime.now(UTC)
-        start = voice_sessions[user_id]
-        seconds += int((now - start).total_seconds())
-
-    mins = max(1, (3600 - seconds) // 60)
-
+    coins, seconds = await get_user_data(interaction.user.id)
+    minutes_left = (3600 - seconds) // 60 if seconds else 0
     await interaction.response.send_message(
-        f"💰 {coins} коинов\n⏳ До награды: {mins} мин",
+        f"💰 Баланс: **{coins}** коинов\n"
+        f"🕒 До следующего начисления: **{minutes_left} мин.**",
         ephemeral=True
     )
 
-@tree.command(name="top")
+@tree.command(name="top", description="Топ участников", guild=guild)
 async def top(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
             "SELECT user_id, coins FROM users ORDER BY coins DESC LIMIT 10"
-        ) as cur:
-            rows = await cur.fetchall()
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    text = "🏆 Топ:\n"
-    for i, (uid, coins) in enumerate(rows, 1):
+    text = "🏆 **Топ участников:**\n"
+    for i, (uid, coins) in enumerate(rows, start=1):
         user = await bot.fetch_user(uid)
-        text += f"{i}. {user} — {coins}\n"
+        text += f"{i}. {user.name} — {coins} коинов\n"
 
     await interaction.response.send_message(text)
 
-# ---------------------- СТАРТ ----------------------
+# ---------------------- ПОКУПКА МИТИНГА ----------------------
+@tree.command(name="buy_meeting", description="Купить организацию митинга", guild=guild)
+@app_commands.describe(
+    title="Название митинга",
+    requirements="Требования или описание митинга",
+    participants="Упоминания участников (например: @user1 @user2)"
+)
+async def buy_meeting(
+    interaction: discord.Interaction,
+    title: str,
+    requirements: str,
+    participants: str
+):
+    if not await remove_coins(interaction.user.id, COINS_FOR_MEETING):
+        await interaction.response.send_message(
+            f"❌ Недостаточно коинов. Требуется {COINS_FOR_MEETING}.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📢 Митинг: {title}",
+        description=requirements,
+        color=discord.Color.red(),
+        timestamp=datetime.now(UTC)
+    )
+    embed.add_field(name="Организатор", value=interaction.user.mention, inline=False)
+    embed.add_field(name="Участники", value=participants, inline=False)
+    embed.set_footer(text="Оплачено Классик Коинами")
+
+    await interaction.response.send_message(
+        "✅ Митинг успешно создан!", ephemeral=True
+    )
+    await interaction.channel.send(content=participants, embed=embed)
+
+# ---------------------- ЗАПУСК БОТА ----------------------
 if not TOKEN:
-    raise ValueError("Нет токена")
+    raise ValueError("Токен бота не найден.")
 
 bot.run(TOKEN)
