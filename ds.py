@@ -6,13 +6,11 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, UTC
 
-# ---------------------- НАСТРОЙКИ ----------------------
+# ---------------------- ЗАГРУЗКА НАСТРОЕК ----------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-
-# Укажите ID вашего сервера и канала со статьями
-GUILD_ID = 1492164546926739577  # Замените на ID вашего сервера
-ARTICLE_CHANNEL_ID = int(os.getenv("ARTICLE_CHANNEL_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID"))
+ARTICLE_CHANNEL_ID = int(os.getenv("ARTICLE_CHANNEL_ID"))
 
 DATABASE = "classic_coins.db"
 
@@ -33,8 +31,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 guild = discord.Object(id=GUILD_ID)
 
-voice_sessions = {}
-invite_cache = {}
+voice_sessions = {}  # user_id -> datetime входа в голос
+invite_cache = {}    # guild_id -> invites
 
 # ---------------------- БАЗА ДАННЫХ ----------------------
 async def init_db():
@@ -42,17 +40,10 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                coins INTEGER DEFAULT 0
+                coins INTEGER DEFAULT 0,
+                voice_seconds INTEGER DEFAULT 0
             )
         """)
-
-        # Добавление столбца voice_seconds, если его нет
-        async with db.execute("PRAGMA table_info(users)") as cursor:
-            columns = [row[1] async for row in cursor]
-        if "voice_seconds" not in columns:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN voice_seconds INTEGER DEFAULT 0"
-            )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
@@ -61,9 +52,18 @@ async def init_db():
                 joined_at TEXT
             )
         """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS articles (
+                message_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                created_at TEXT
+            )
+        """)
+
         await db.commit()
 
-# ---------------------- РАБОТА С КОИНАМИ ----------------------
+# ---------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------------------
 async def ensure_user(user_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
@@ -128,15 +128,15 @@ async def add_voice_time(user_id: int, seconds: int):
         )
         await db.commit()
 
-# ---------------------- СОБЫТИЯ ----------------------
+# ---------------------- СОБЫТИЕ ЗАПУСКА ----------------------
 @bot.event
 async def on_ready():
     await init_db()
     print(f"✅ Бот {bot.user} запущен!")
 
-    # Мгновенная синхронизация команд для сервера
+    # Мгновенная регистрация команд для сервера
     await tree.sync(guild=guild)
-    print("✅ Slash-команды синхронизированы для сервера.")
+    print("✅ Slash-команды синхронизированы.")
 
     # Кэш приглашений
     for g in bot.guilds:
@@ -145,6 +145,14 @@ async def on_ready():
             invite_cache[g.id] = {invite.code: invite.uses for invite in invites}
         except discord.Forbidden:
             invite_cache[g.id] = {}
+
+    # Фиксация пользователей, уже находящихся в голосовых каналах
+    now = datetime.now(UTC)
+    for g in bot.guilds:
+        for channel in g.voice_channels:
+            for member in channel.members:
+                if not member.bot:
+                    voice_sessions[member.id] = now
 
 # ---------------------- РЕФЕРАЛЬНАЯ СИСТЕМА ----------------------
 @tree.command(name="referral", description="Получить реферальную ссылку", guild=guild)
@@ -184,27 +192,33 @@ async def on_member_join(member):
 
     if inviter and inviter.id != member.id:
         await add_coins(inviter.id, COINS_PER_REFERRAL)
-        try:
-            await inviter.send(
-                f"🎉 Вы пригласили {member.mention} и получили {COINS_PER_REFERRAL} коинов!"
-            )
-        except discord.Forbidden:
-            pass
 
-# ---------------------- НАГРАДА ЗА СТАТЬИ ----------------------
+# ---------------------- НАГРАДА ЗА СТАТЬЮ ----------------------
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
     if message.channel.id == ARTICLE_CHANNEL_ID:
-        if len(message.content) >= MIN_ARTICLE_LENGTH:
-            await add_coins(message.author.id, COINS_PER_ARTICLE)
-            await message.add_reaction("🪙")
-        else:
-            await message.reply(
-                f"Статья должна содержать не менее {MIN_ARTICLE_LENGTH} символов."
-            )
+        async with aiosqlite.connect(DATABASE) as db:
+            async with db.execute(
+                "SELECT 1 FROM articles WHERE message_id = ?",
+                (message.id,)
+            ) as cursor:
+                exists = await cursor.fetchone()
+
+        if not exists:
+            if len(message.content.strip()) >= MIN_ARTICLE_LENGTH or message.attachments:
+                await add_coins(message.author.id, COINS_PER_ARTICLE)
+
+                async with aiosqlite.connect(DATABASE) as db:
+                    await db.execute(
+                        "INSERT INTO articles (message_id, user_id, created_at) VALUES (?, ?, ?)",
+                        (message.id, message.author.id, datetime.now(UTC).isoformat())
+                    )
+                    await db.commit()
+
+                await message.add_reaction("🪙")
 
     await bot.process_commands(message)
 
@@ -219,19 +233,32 @@ async def on_voice_state_update(member, before, after):
     if before.channel is None and after.channel is not None:
         voice_sessions[member.id] = now
     elif before.channel is not None and after.channel is None:
-        start = voice_sessions.pop(member.id, None)
-        if start:
-            seconds = int((now - start).total_seconds())
+        start_time = voice_sessions.pop(member.id, None)
+        if start_time:
+            seconds = int((now - start_time).total_seconds())
             await add_voice_time(member.id, seconds)
 
-# ---------------------- КОМАНДЫ ----------------------
+# ---------------------- SLASH-КОМАНДЫ ----------------------
 @tree.command(name="balance", description="Показать баланс", guild=guild)
 async def balance(interaction: discord.Interaction):
-    coins, seconds = await get_user_data(interaction.user.id)
-    minutes_left = (3600 - seconds) // 60 if seconds else 0
+    coins, stored_seconds = await get_user_data(interaction.user.id)
+
+    additional_seconds = 0
+    if interaction.user.id in voice_sessions:
+        additional_seconds = int(
+            (datetime.now(UTC) - voice_sessions[interaction.user.id]).total_seconds()
+        )
+
+    total_seconds = stored_seconds + additional_seconds
+    remaining_seconds = 3600 - (total_seconds % 3600)
+    if remaining_seconds == 3600:
+        remaining_seconds = 0
+
+    minutes_left = remaining_seconds // 60
+
     await interaction.response.send_message(
         f"💰 Баланс: **{coins}** коинов\n"
-        f"🕒 До следующего начисления: **{minutes_left} мин.**",
+        f"🕒 До следующей награды: **{minutes_left} мин.**",
         ephemeral=True
     )
 
@@ -250,12 +277,11 @@ async def top(interaction: discord.Interaction):
 
     await interaction.response.send_message(text)
 
-# ---------------------- ПОКУПКА МИТИНГА ----------------------
 @tree.command(name="buy_meeting", description="Купить организацию митинга", guild=guild)
 @app_commands.describe(
     title="Название митинга",
-    requirements="Требования или описание митинга",
-    participants="Упоминания участников (например: @user1 @user2)"
+    requirements="Требования митинга",
+    participants="Упоминания участников (@user1 @user2)"
 )
 async def buy_meeting(
     interaction: discord.Interaction,
@@ -280,13 +306,11 @@ async def buy_meeting(
     embed.add_field(name="Участники", value=participants, inline=False)
     embed.set_footer(text="Оплачено Классик Коинами")
 
-    await interaction.response.send_message(
-        "✅ Митинг успешно создан!", ephemeral=True
-    )
+    await interaction.response.send_message("✅ Митинг успешно создан!", ephemeral=True)
     await interaction.channel.send(content=participants, embed=embed)
 
 # ---------------------- ЗАПУСК БОТА ----------------------
 if not TOKEN:
-    raise ValueError("Токен бота не найден.")
+    raise ValueError("❌ Токен бота не найден.")
 
 bot.run(TOKEN)
