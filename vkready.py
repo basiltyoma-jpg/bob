@@ -2,6 +2,7 @@ import json
 import random
 import threading
 import time
+import os
 from datetime import datetime
 from flask import Flask, request, Response
 
@@ -9,15 +10,17 @@ import vk_api
 from vk_api.utils import get_random_id
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.exceptions import ApiError
+from vk_api import VkUpload
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+import matplotlib.pyplot as plt
+
 # ================== НАСТРОЙКИ ==================
 GROUP_ID = 237302992  # ID вашей группы
-VK_TOKEN = "vk1.a.8lJ7EnqzklLXvnG3YXG79oBfmDjafZ4tfqtYx35ysbv9xtNCqyTgGWX6HPmrObkcs_x2jLuV9s-T2zjyVCjW1w26sP7YdGRshJK-V-_Ti8AW24WnDQ2CYkr_GSuujFgNINcvJiNJy3Q9S7gqMkf86vqvSPz3EG_9H2SLeOjq8QqWP9EMtHQkAM7UnMFSPZvScPIWEvxDiwqoO9srjdtl0Q"  # Токен группы
-CONFIRMATION_TOKEN = "4a01fb80"  # Строка подтверждения из VK Callback API
-
+VK_TOKEN = os.getenv("VK_TOKEN")
+CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN")
 DATA_FILE = "data.json"
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
@@ -25,6 +28,7 @@ app = Flask(__name__)
 
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
+upload = VkUpload(vk_session)
 
 states = {}  # Состояния пользователей
 
@@ -44,7 +48,11 @@ data = load_data()
 
 def ensure_user(user_id):
     if str(user_id) not in data:
-        data[str(user_id)] = {"deadlines": [], "notes": []}
+        data[str(user_id)] = {
+            "deadlines": [],
+            "notes": [],
+            "grades": {}  # Оценки для интеграции с ЭПОС
+        }
 
 # ================== ОТПРАВКА СООБЩЕНИЙ ==================
 def send_message(user_id, text, keyboard=None, attachment=None):
@@ -69,6 +77,9 @@ def main_keyboard():
     keyboard.add_button("📝 Мои заметки", VkKeyboardColor.SECONDARY)
     keyboard.add_line()
     keyboard.add_button("🔍 AI-поиск", VkKeyboardColor.PRIMARY)
+    keyboard.add_button("📊 Успеваемость", VkKeyboardColor.SECONDARY)
+    keyboard.add_line()
+    keyboard.add_button("➕ Оценка", VkKeyboardColor.POSITIVE)
     keyboard.add_button("❌ Отмена", VkKeyboardColor.NEGATIVE)
     return keyboard.get_keyboard()
 
@@ -130,6 +141,34 @@ def reminder_loop():
 
 threading.Thread(target=reminder_loop, daemon=True).start()
 
+# ================== ГРАФИК УСПЕВАЕМОСТИ ==================
+def generate_performance_chart(user_id):
+    grades = data[str(user_id)].get("grades", {})
+    if not grades:
+        return None
+
+    plt.figure(figsize=(8, 5))
+    for subject, marks in grades.items():
+        plt.plot(range(1, len(marks) + 1), marks, marker='o', label=subject)
+
+    plt.title("График успеваемости")
+    plt.xlabel("Номер оценки")
+    plt.ylabel("Оценка")
+    plt.ylim(1, 5)
+    plt.grid(True)
+    plt.legend()
+
+    filename = f"performance_{user_id}.png"
+    plt.savefig(filename)
+    plt.close()
+    return filename
+
+def upload_photo(file_path):
+    photo = upload.photo_messages(file_path)[0]
+    attachment = f"photo{photo['owner_id']}_{photo['id']}"
+    os.remove(file_path)
+    return attachment
+
 # ================== CALLBACK API ==================
 @app.route('/', methods=['POST'])
 def callback():
@@ -139,7 +178,7 @@ def callback():
     if event['type'] == 'confirmation':
         return Response(CONFIRMATION_TOKEN, status=200, mimetype='text/plain')
 
-    # Обработка нажатия inline-кнопок
+    # Обработка inline-кнопок
     if event['type'] == 'message_event':
         payload = event['object']['payload']
         user_id = event['object']['user_id']
@@ -150,11 +189,7 @@ def callback():
             try:
                 removed = data[str(user_id)]["deadlines"].pop(index)
                 save_data(data)
-                send_message(
-                    user_id,
-                    f"✅ Дедлайн удалён: {removed['text']}",
-                    main_keyboard()
-                )
+                send_message(user_id, f"✅ Дедлайн удалён: {removed['text']}", main_keyboard())
             except IndexError:
                 send_message(user_id, "❌ Ошибка удаления.", main_keyboard())
 
@@ -163,15 +198,10 @@ def callback():
             try:
                 data[str(user_id)]["notes"].pop(index)
                 save_data(data)
-                send_message(
-                    user_id,
-                    "✅ Заметка удалена.",
-                    main_keyboard()
-                )
+                send_message(user_id, "✅ Заметка удалена.", main_keyboard())
             except IndexError:
                 send_message(user_id, "❌ Ошибка удаления.", main_keyboard())
 
-        # Сообщаем VK об успешной обработке
         vk.messages.sendMessageEventAnswer(
             event_id=event['object']['event_id'],
             user_id=user_id,
@@ -179,7 +209,7 @@ def callback():
         )
         return Response('ok', status=200)
 
-    # Обработка новых сообщений
+    # Обработка сообщений
     if event['type'] == 'message_new':
         message = event['object']['message']
         user_id = message['from_id']
@@ -189,16 +219,16 @@ def callback():
         ensure_user(user_id)
 
         # Отмена действия
-        if text == "отмена" or text == "❌ отмена":
+        if text in ["отмена", "❌ отмена"]:
             states[user_id] = None
             send_message(user_id, "❌ Действие отменено.", main_keyboard())
             return Response('ok', status=200)
 
-        # Главное меню
+        # Приветствие
         if text in ["привет", "начать", "start"]:
             send_message(
                 user_id,
-                "👋 Привет! Я бот для управления дедлайнами и заметками.",
+                "👋 Привет! Я бот для управления дедлайнами, заметками и отслеживания успеваемости.",
                 main_keyboard()
             )
             return Response('ok', status=200)
@@ -208,9 +238,7 @@ def callback():
             states[user_id] = "add_deadline"
             send_message(
                 user_id,
-                "Введите дедлайн в формате:\n"
-                "ДД.ММ.ГГГГ ЧЧ:ММ Описание\n\n"
-                "Пример: 25.12.2025 18:00 Сдать проект",
+                "Введите дедлайн в формате:\nДД.ММ.ГГГГ ЧЧ:ММ Описание",
                 main_keyboard()
             )
             return Response('ok', status=200)
@@ -230,11 +258,7 @@ def callback():
         # Добавление заметки
         if text == "➕ заметка":
             states[user_id] = "add_note"
-            send_message(
-                user_id,
-                "Отправьте фотографию конспекта с описанием.",
-                main_keyboard()
-            )
+            send_message(user_id, "Отправьте фотографию конспекта с описанием.", main_keyboard())
             return Response('ok', status=200)
 
         # Просмотр заметок
@@ -256,6 +280,26 @@ def callback():
         if text == "🔍 ai-поиск":
             states[user_id] = "search"
             send_message(user_id, "Введите текст для поиска.", main_keyboard())
+            return Response('ok', status=200)
+
+        # Добавление оценки (ЭПОС)
+        if text == "➕ оценка":
+            states[user_id] = "add_grade"
+            send_message(
+                user_id,
+                "Введите оценку в формате:\nПредмет Оценка\nПример: Математика 5",
+                main_keyboard()
+            )
+            return Response('ok', status=200)
+
+        # График успеваемости
+        if text == "📊 успеваемость":
+            chart_path = generate_performance_chart(user_id)
+            if chart_path:
+                attachment = upload_photo(chart_path)
+                send_message(user_id, "📊 Ваш график успеваемости:", main_keyboard(), attachment)
+            else:
+                send_message(user_id, "❌ У вас пока нет добавленных оценок.", main_keyboard())
             return Response('ok', status=200)
 
         # Обработка состояний
@@ -310,6 +354,22 @@ def callback():
             states[user_id] = None
             return Response('ok', status=200)
 
+        elif state == "add_grade":
+            try:
+                subject, grade = message['text'].rsplit(" ", 1)
+                grade = int(grade)
+
+                if subject not in data[str(user_id)]["grades"]:
+                    data[str(user_id)]["grades"][subject] = []
+
+                data[str(user_id)]["grades"][subject].append(grade)
+                save_data(data)
+                states[user_id] = None
+                send_message(user_id, "✅ Оценка успешно добавлена!", main_keyboard())
+            except Exception:
+                send_message(user_id, "❌ Неверный формат. Попробуйте снова.", main_keyboard())
+            return Response('ok', status=200)
+
         send_message(user_id, "Выберите действие:", main_keyboard())
         return Response('ok', status=200)
 
@@ -317,7 +377,9 @@ def callback():
 
 # ================== ЗАПУСК ==================
 def main():
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 
 if __name__ == "__main__":
     main()
